@@ -158,7 +158,7 @@ def run_one_epoch(
             # ── 预测模型有监督损失 ──────────────────────────────────────
             pred_loss = compute_predictor_loss(preds, tgt.unsqueeze(0), k)
 
-            # ── L_diff 辅助损失（仅 OurModel 使用，其他模型无 last_x_diff）──
+            # ── L_diff 辅助损失（仅 Hyperion 使用，其他模型无 last_x_diff）──
             # L_diff = MSE(x_diff, event_target)，其中 event_target 是
             # 前 k_val 步内是否发生事件的 max 聚合二值标签
             x_diff_pred = getattr(predictor, 'last_x_diff', None)

@@ -7,7 +7,7 @@
 #   3. 直接运行: python train.py
 #
 # ── 可选模型（ACTIVE_MODEL）────────────────────────────────────────────────
-#   "our_model"     —— 主模型：ConFormer 风格编码器（无 GCN）+ ASTER RL
+#   "hyperion"     —— 主模型：ConFormer 风格编码器（无 GCN）+ ASTER RL
 #   "conformer_rl"  —— 基线 ：ConFormer 原版编码器（含 GCN + ToD/DoW Emb）+ ASTER RL
 #   "aster"         —— 基线 ：ASTER 原版双编码器（Conv1D + MTGNN-lite）+ ASTER RL
 #   "fc_lstm"       —— 基线 ：FC-LSTM 编码器 + ASTER RL
@@ -27,7 +27,7 @@
 #
 #   ConFormer 原始 model_args input_dim=1：仅速度进 input_proj，
 #   ch1/ch2 另走 Embedding 查表。
-#   我们的编码器（our_model / fc_lstm / stgcn / staeformer / aster）
+#   我们的编码器（hyperion / fc_lstm / stgcn / staeformer / aster）
 #   无独立 Embedding 查表，所有通道统一走线性层，因此 input_dim=3。
 #   conformer_rl 内部自己区分 ch0/ch1/ch2，外部 input_dim 仍为 3。
 #
@@ -39,11 +39,11 @@
 
 # ── 切换这两行即可选择实验条件 ──────────────────────────────────────────────
 ACTIVE_DATASET = "TKY"
-ACTIVE_MODEL   = "our_model"    # 见上方列表
+ACTIVE_MODEL   = "hyperion"    # 见上方列表
 
 # ── 合法模型名集合（用于 train.py 的断言检查）──────────────────────────────
 VALID_MODELS = frozenset(
-    ["our_model", "conformer_rl", "aster", "fc_lstm", "stgcn", "staeformer"]
+    ["hyperion", "conformer_rl", "aster", "fc_lstm", "stgcn", "staeformer"]
 )
 
 
