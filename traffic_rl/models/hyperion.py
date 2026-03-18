@@ -41,7 +41,7 @@
 #   num_heads        — 多头注意力头数
 #   num_layers  L    — GLN 层数
 #   K_max            — 最大预测步数
-#   diff_K           — 超图扩散迭代步数（默认 3）
+#   k_per_edge       — 超图每条超边保留节点数（top-k 稀疏，默认 max(4, N//32)）
 # =============================================================================
 
 import torch
@@ -127,46 +127,75 @@ class _ResilienceEncoder(nn.Module):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Stage 3  :  超图反应扩散（Hypergraph Reaction-Diffusion）
+# Stage 3  :  超图卷积（Hypergraph Convolution，单次）
 # ─────────────────────────────────────────────────────────────────────────────
 
-class _HypergraphDiffusion(nn.Module):
+class _HypergraphConv(nn.Module):
     """
-    超图反应扩散，K 步迭代：
-      Θ = softmax(H) @ softmax(H).T      [N, N]  归一化超图传播算子
-      x_{t+1} = (1 - δ) * x_t + δ * (Θ @ x_t)
+    真正的超图卷积（单次，非迭代）：
 
-    H ∈ R^{N × E}：可学习节点-超边关联矩阵（E = N//8 超边）。
-    以速度通道（ch0 最后一步）作为初始扩散信号，
-    输出每节点的事件扩散概率 x_diff ∈ (0,1)。
+      H ∈ R^{N × E}：可学习节点-超边关联矩阵
+      W ∈ R^{E}    ：可学习超边权重
+
+    MTGNN 风格稀疏化：对每条超边（H 的每列）用 top-k 只保留
+    关联最强的 k_per_edge 个节点，其余置零，避免稠密全连接退化为普通图。
+
+    归一化超图卷积公式（Feng et al. AAAI 2019）：
+      Θ = D_v^{-1} · H · diag(W/D_e) · H^T       [N, N]
+      x_diff = sigmoid(Θ · x_speed)
+
+    为避免显式构造 [N, N] 矩阵，用两步 einsum 实现：
+      Step 1 (节点→超边): a[e] = Σ_n H[n,e] · x[n]
+      Step 2 (超边→节点): b[n] = Σ_e H_w[n,e] · a[e]
+      其中 H_w[n,e] = H[n,e] · W[e] / D_e[e]，最后除以 D_v[n]
     """
 
     def __init__(self, num_nodes: int,
-                 num_hyperedges: int = None, K: int = 3):
+                 num_hyperedges: int = None,
+                 k_per_edge: int = None):
         super().__init__()
-        self.K = K
         E = num_hyperedges or max(4, num_nodes // 8)
-        # 可学习超边关联（小初始化避免 softmax 过早饱和）
-        self.H = nn.Parameter(torch.randn(num_nodes, E) * 0.1)
+        # top-k：每条超边最多保留这么多节点（MTGNN 风格稀疏约束）
+        self.k_per_edge = k_per_edge or max(4, num_nodes // 32)
+        # 可学习关联矩阵（小初始化）
+        self.H_raw = nn.Parameter(torch.randn(num_nodes, E) * 0.1)
+        # 可学习超边权重（初始化为 1）
+        self.W = nn.Parameter(torch.ones(E))
 
-    def forward(self, x_speed: torch.Tensor,
-                delta: torch.Tensor) -> torch.Tensor:
+    def forward(self, x_speed: torch.Tensor) -> torch.Tensor:
         """
-        x_speed : [B, N, 1]  —  速度特征（初始信号）
-        delta   : [N]        —  每节点恢复率（扩散步长）
-        返回    : [B, N, 1]  —  扩散后事件概率（sigmoid 输出）
+        x_speed : [B, N, 1]  —  速度特征（ch0 最后一步）
+        返回    : [B, N, 1]  —  超图卷积后的事件传播特征，sigmoid 压缩到 (0,1)
         """
-        H_norm = torch.softmax(self.H, dim=0)        # [N, E]
-        Theta  = H_norm @ H_norm.t()                 # [N, N]
+        N, E = self.H_raw.shape
+        k = min(self.k_per_edge, N)
 
-        x       = x_speed                            # [B, N, 1]
-        delta_v = delta.view(1, -1, 1)               # [1, N, 1]
+        # ── MTGNN 风格 top-k 稀疏化 ────────────────────────────────
+        # 对每条超边（H 的每列）保留前 k 个关联最强的节点
+        H_t = self.H_raw.t()                              # [E, N]
+        topk_vals, topk_idx = H_t.topk(k, dim=1)          # [E, k]
+        # 用 softmax 把 top-k 值归一化为概率权重
+        sparse_w = torch.softmax(topk_vals, dim=1)         # [E, k]
+        H_sparse_t = torch.zeros_like(H_t)
+        H_sparse_t.scatter_(1, topk_idx, sparse_w)
+        H_sparse = H_sparse_t.t()                          # [N, E]
 
-        for _ in range(self.K):
-            diffuse = torch.einsum('nm,bm1->bn1', Theta, x)
-            x = (1.0 - delta_v) * x + delta_v * diffuse
+        # ── 度矩阵 ─────────────────────────────────────────────────
+        D_v = H_sparse.sum(dim=1).clamp(min=1e-6)          # [N] 节点度
+        D_e = H_sparse.sum(dim=0).clamp(min=1e-6)          # [E] 超边度
+        W   = self.W.abs()                                  # [E] 超边权重（非负）
 
-        return torch.sigmoid(x)   # [B, N, 1]
+        # 归一化：H_w[n,e] = H_sparse[n,e] * W[e] / D_e[e]
+        H_w = H_sparse * (W / D_e).unsqueeze(0)            # [N, E]
+
+        # ── 超图卷积（两步 einsum，不显式构造 [N,N]）──────────────
+        # Step 1：节点 → 超边聚合
+        a = torch.einsum('ne,bn1->be1', H_sparse, x_speed) # [B, E, 1]
+        # Step 2：超边 → 节点聚合 + 节点度归一化
+        b = torch.einsum('ne,be1->bn1', H_w, a)            # [B, N, 1]
+        x_out = b / D_v.view(1, N, 1)
+
+        return torch.sigmoid(x_out)                         # [B, N, 1]
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -380,8 +409,8 @@ class Hyperion(nn.Module):
         heads     = cfg["num_heads"]
         layers    = cfg["num_layers"]
         dropout   = cfg["dropout"]
-        total_res = cfg["total_resources"]
-        diff_K    = cfg.get("diff_K", 3)
+        total_res   = cfg["total_resources"]
+        k_per_edge  = cfg.get("k_per_edge", max(4, N // 32))
 
         # ── Stage 1 : 时间展平 + 线性投影（短/长期各一个）────────────
         self.short_proj = nn.Linear(T_short * C, D)
@@ -397,8 +426,8 @@ class Hyperion(nn.Module):
         # ── Stage 2 : 弹性编码器 ─────────────────────────────────────
         self.resil_enc = _ResilienceEncoder(N)
 
-        # ── Stage 3 : 超图反应扩散 ───────────────────────────────────
-        self.hyper_diff = _HypergraphDiffusion(N, K=diff_K)
+        # ── Stage 3 : 超图卷积（单次，MTGNN 风格稀疏化）────────────
+        self.hyper_conv = _HypergraphConv(N, k_per_edge=k_per_edge)
 
         # ── Stage 5-6 : RC-GLN 调制注意力层（c_aug_dim = c_dim + 3）─
         c_aug_dim = c_dim + 3   # c ‖ log_τ(1) ‖ δ(1) ‖ x_diff(1)
@@ -479,10 +508,10 @@ class Hyperion(nn.Module):
         tau, delta = self.resil_enc()                        # [N], [N]
         log_tau    = torch.log(tau + 1e-6)                   # [N]
 
-        # ── Stage 3 : 超图反应扩散 ────────────────────────────────────
-        # 用长期窗口最后一步的速度通道（ch0）作为初始扩散信号
+        # ── Stage 3 : 超图卷积（单次）────────────────────────────────
+        # 用长期窗口最后一步的速度通道（ch0）作为输入信号
         x_speed = long_term[:, -1, :, 0:1]                  # [B, N, 1]
-        x_diff  = self.hyper_diff(x_speed, delta)            # [B, N, 1]
+        x_diff  = self.hyper_conv(x_speed)                   # [B, N, 1]
         self.last_x_diff = x_diff.detach()                   # 供外部 L_diff
 
         # ── Stage 4 : 节点条件嵌入 c（扩展到 batch）────────────────
