@@ -157,6 +157,21 @@ def run_one_epoch(
 
             # ── 预测模型有监督损失 ──────────────────────────────────────
             pred_loss = compute_predictor_loss(preds, tgt.unsqueeze(0), k)
+
+            # ── L_diff 辅助损失（仅 OurModel 使用，其他模型无 last_x_diff）──
+            # L_diff = MSE(x_diff, event_target)，其中 event_target 是
+            # 前 k_val 步内是否发生事件的 max 聚合二值标签
+            x_diff_pred = getattr(predictor, 'last_x_diff', None)
+            if x_diff_pred is not None:
+                event_tgt = (
+                    tgt[:k_val, :, 0:1]         # [k_val, N, 1]
+                    .max(dim=0).values           # [N, 1]
+                    .unsqueeze(0)                # [1, N, 1]
+                    .to(device)
+                )
+                l_diff    = F.mse_loss(x_diff_pred, event_tgt)
+                pred_loss = pred_loss + 0.1 * l_diff
+
             optimizer.zero_grad()
             pred_loss.backward()
             torch.nn.utils.clip_grad_norm_(predictor.parameters(), max_norm=5.0)

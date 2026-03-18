@@ -56,8 +56,8 @@ from trainer.evaluate import run_evaluate
 def build_model(model_name: str, cfg: dict):
     """根据 model_name 实例化对应的 Predictor。"""
     if model_name == "our_model":
-        from models.predictor import ResourcePredictor
-        return ResourcePredictor(cfg)
+        from models.our_model import OurModel
+        return OurModel(cfg)
 
     elif model_name == "conformer_rl":
         from baselines.conformer_rl import ConFormerRLPredictor
@@ -166,8 +166,10 @@ def main():
     print(f"[2/4] 初始化模型 [{model_name}]...")
     predictor = build_model(model_name, cfg).to(device)
 
-    C_common  = cfg["C_common"]
-    state_dim = N * (C_common + 4)   # hidden + resources(1) + cooldown(1) + xy(2)
+    # state_dim：模型隐层维度 + 每节点 4 个外部特征（res, cool, x, y）
+    # OurModel 暴露 state_hidden_dim = D+3；基线使用 C_common
+    state_hidden_dim = getattr(predictor, 'state_hidden_dim', cfg["C_common"])
+    state_dim = N * (state_hidden_dim + 4)
     agent     = DQNAgent(state_dim, N, cfg, device)
 
     env        = ResourceEnv(N, cfg["total_resources"], cfg["K_max"])
