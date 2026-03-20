@@ -100,126 +100,119 @@ class _AdaptiveGCN(nn.Module):
 
 class _ResilienceEncoder(nn.Module):
     """
-    每节点可学习弹性参数（全局，不依赖输入）：
-      τ   ∈ (0, ∞)  —  弹性时间尺度，越大表示系统恢复越慢
-      δ   ∈ (0, 1)  —  恢复率（扩散步长），越大表示事件扩散越快
+    全局弹性参数（标量，整个网络共享）：
+      τ ∈ (0, ∞)  —  ODE 积分时域长度，越大扩散越深
+      δ ∈ (0, 1)  —  扩散强度因子，越大事件传播越广
 
-    使用 softplus / sigmoid 保证参数范围合法。
+    两个参数在 unconstrained 空间存储，前向时映射到合法范围。
     """
 
-    def __init__(self, num_nodes: int):
+    def __init__(self):
         super().__init__()
-        # 参数在 unconstrained 空间存储，前向时转换
-        self._raw_tau   = nn.Parameter(torch.zeros(num_nodes))
-        self._raw_delta = nn.Parameter(torch.zeros(num_nodes))
-
-    @property
-    def tau(self) -> torch.Tensor:
-        return F.softplus(self._raw_tau)          # [N], >0
-
-    @property
-    def delta(self) -> torch.Tensor:
-        return torch.sigmoid(self._raw_delta)     # [N], (0,1)
+        self._raw_tau   = nn.Parameter(torch.zeros(1))   # softplus → τ
+        self._raw_delta = nn.Parameter(torch.zeros(1))   # sigmoid  → δ
 
     def forward(self):
-        """返回 (τ [N], δ [N])"""
-        return self.tau, self.delta
+        """返回 (τ [1], δ [1])  全局标量"""
+        tau   = F.softplus(self._raw_tau)      # (0, ∞)
+        delta = torch.sigmoid(self._raw_delta) # (0, 1)
+        return tau, delta
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Stage 3  :  超图卷积（Hypergraph Convolution，单次）
 # ─────────────────────────────────────────────────────────────────────────────
 
-class _DynamicHypergraphConv(nn.Module):
+class _GraphODEHypergraph(nn.Module):
     """
-    动态超图卷积（单次）：先图衰减构造超边，再做超图卷积。
+    Graph ODE → 稀疏超图卷积，一体化模块，整个网络只调用一次。
 
-    Stage A — 图衰减传播（δ 恢复物理意义）：
-      A_decay = softmax(relu(nv1 @ nv2))   可学习邻接矩阵
-      z = (1 - δ) * h  +  δ * (A_decay @ h)
-          ↑ 特征留在自身    ↑ 按 δ 比例扩散到邻居
-      δ 越大 → 特征扩散越远 → 超边划分越"全局"
-      δ 越小 → 特征集中在本地 → 超边划分越"局部"
+    Stage 1 — Graph ODE（连续扩散，Euler 离散）：
+      dH/dt = tanh( A_ode @ H @ W_ode )
+      A_ode = softmax(relu(nv1 @ nv2))   可学习图，不依赖固定拓扑
+      从 H(0) = h_gcn 积分到 H(δ)，δ 为全局扩散深度标量
+      → H_T [B, N, D]  扩散后的时空特征
 
-    Stage B — 动态超边构造（MTGNN top-k 稀疏）：
-      H_logit[b,n,e] = edge_proj(z[b,n]) · proto[e]   [B, N, E]
-      对每条超边 top-k 个最强节点 → H_sparse [B, N, E]
-      特征相似（经衰减后相近）的节点自然被分配到同一超边
+    Stage 2 — 动态超边构造（MTGNN top-k 稀疏）：
+      H_logit = edge_proj(H_T)    [B, N, E]
+      对每条超边保留 top-k 最强节点 → H_sparse [B, N, E]
+      扩散后特征相似的节点自然被划入同一超边
 
-    Stage C — 归一化超图卷积（Feng et al. AAAI 2019）：
-      a[b,e,d] = Σ_n H_sparse[b,n,e] * z[b,n,d]        节点→超边
+    Stage 3 — 归一化超图卷积（Feng et al. AAAI 2019）：
+      a[b,e,d]   = Σ_n H_sparse[b,n,e] * H_T[b,n,d]   节点→超边
       out[b,n,d] = D_v^{-1} Σ_e H_w[b,n,e] * a[b,e,d]  超边→节点
       → Linear(D→1) + sigmoid → x_diff [B, N, 1]
 
-    两步 einsum 实现，不显式构造 [N, N] 矩阵。
+    两步 einsum，不显式构造 [N, N] 矩阵。
     """
 
     def __init__(self, num_nodes: int, in_dim: int,
                  num_hyperedges: int = None,
-                 k_per_edge: int = None,
-                 embed_dim: int = 10):
+                 k_per_edge:    int = None,
+                 ode_steps:     int = 3,
+                 embed_dim:     int = 10):
         super().__init__()
         E = num_hyperedges or max(4, num_nodes // 8)
         self.k_per_edge = k_per_edge or max(4, num_nodes // 32)
+        self.ode_steps  = ode_steps
 
-        # Stage A：图衰减用的可学习邻接（MTGNN 风格）
-        self.nv1 = nn.Parameter(torch.randn(num_nodes, embed_dim))
-        self.nv2 = nn.Parameter(torch.randn(embed_dim, num_nodes))
+        # Stage 1：Graph ODE 可学习邻接（MTGNN 风格）
+        self.nv1    = nn.Parameter(torch.randn(num_nodes, embed_dim))
+        self.nv2    = nn.Parameter(torch.randn(embed_dim, num_nodes))
+        # ODE 动力学线性变换 W_ode
+        self.ode_W  = nn.Linear(in_dim, in_dim, bias=False)
 
-        # Stage B：时空特征 → 超边分配 logit
+        # Stage 2：超边分配投影
         self.edge_proj = nn.Linear(in_dim, E)
 
-        # Stage C：可学习超边权重
-        self.W = nn.Parameter(torch.ones(E))
+        # Stage 3：可学习超边权重
+        self.edge_W = nn.Parameter(torch.ones(E))
 
-        # 输出投影：D → 1（事件传播概率）
+        # 输出：D → 1
         self.out_proj = nn.Linear(in_dim, 1)
+
+    def _f(self, H: torch.Tensor, A: torch.Tensor) -> torch.Tensor:
+        """ODE 右端项: f(H) = tanh(A @ H @ W_ode)"""
+        return torch.tanh(torch.einsum('nm,bmd->bnd', A, self.ode_W(H)))
 
     def forward(self, h: torch.Tensor,
                 delta: torch.Tensor) -> torch.Tensor:
         """
-        h     : [B, N, D]  —  GCN 输出的时空特征
-        delta : [N]        —  每节点恢复率（控制图衰减扩散比例）
-        返回  : [B, N, 1]  —  超图卷积后的事件传播特征 ∈ (0,1)
+        h     : [B, N, D]  —  GCN 输出（ODE 初始状态 H(0)）
+        delta : [1]        —  全局扩散深度（ODE 积分时间 T = δ）
+        返回  : [B, N, 1]  —  超图卷积后的事件传播概率 ∈ (0,1)
         """
         B, N, D = h.shape
         k = min(self.k_per_edge, N)
 
-        # ── Stage A : δ 控制的图衰减传播 ────────────────────────────
-        A = torch.softmax(
-            torch.relu(self.nv1 @ self.nv2), dim=-1
-        )                                                    # [N, N]
-        h_neigh  = torch.einsum('nm,bmd->bnd', A, h)        # [B, N, D]
-        delta_v  = delta.view(1, N, 1)                       # [1, N, 1]
-        z = (1.0 - delta_v) * h + delta_v * h_neigh         # [B, N, D]
+        # ── Stage 1 : Graph ODE（固定步数 Euler 积分）───────────────
+        A  = torch.softmax(torch.relu(self.nv1 @ self.nv2), dim=-1)  # [N, N]
+        dt = delta / self.ode_steps                                   # 标量步长
+        H  = h
+        for _ in range(self.ode_steps):
+            H = H + dt * self._f(H, A)
+        # H : [B, N, D]  即 H(δ)，扩散后的时空特征
 
-        # ── Stage B : 动态超边构造 ───────────────────────────────────
-        # 把衰减后的时空特征投影到超边分配空间
-        H_logit = self.edge_proj(z)                          # [B, N, E]
-
-        # MTGNN top-k：对每条超边保留关联最强的 k 个节点
-        H_t = H_logit.permute(0, 2, 1)                      # [B, E, N]
-        topk_vals, topk_idx = H_t.topk(k, dim=-1)           # [B, E, k]
-        sparse_w = torch.softmax(topk_vals, dim=-1)          # [B, E, k]
+        # ── Stage 2 : 动态超边构造 ───────────────────────────────────
+        H_logit   = self.edge_proj(H)               # [B, N, E]
+        H_t       = H_logit.permute(0, 2, 1)        # [B, E, N]
+        topk_vals, topk_idx = H_t.topk(k, dim=-1)   # [B, E, k]
+        sparse_w  = torch.softmax(topk_vals, dim=-1) # [B, E, k]
         H_sparse_t = torch.zeros_like(H_t)
         H_sparse_t.scatter_(-1, topk_idx, sparse_w)
-        H_sparse = H_sparse_t.permute(0, 2, 1)              # [B, N, E]
+        H_sparse  = H_sparse_t.permute(0, 2, 1)     # [B, N, E]
 
-        # ── Stage C : 归一化超图卷积 ─────────────────────────────────
-        D_v = H_sparse.sum(dim=2).clamp(min=1e-6)           # [B, N]
-        D_e = H_sparse.sum(dim=1).clamp(min=1e-6)           # [B, E]
-        W   = self.W.abs()                                   # [E]
+        # ── Stage 3 : 归一化超图卷积 ─────────────────────────────────
+        D_v  = H_sparse.sum(dim=2).clamp(min=1e-6)  # [B, N]
+        D_e  = H_sparse.sum(dim=1).clamp(min=1e-6)  # [B, E]
+        W    = self.edge_W.abs()                     # [E]
+        H_w  = H_sparse * (W / D_e).unsqueeze(1)    # [B, N, E]
 
-        # H_w[b,n,e] = H_sparse[b,n,e] * W[e] / D_e[b,e]
-        H_w = H_sparse * (W / D_e).unsqueeze(1)             # [B, N, E]
+        a    = torch.einsum('bne,bnd->bed', H_sparse, H)   # [B, E, D]
+        out  = torch.einsum('bne,bed->bnd', H_w, a)        # [B, N, D]
+        out  = out / D_v.unsqueeze(-1)                      # [B, N, D]
 
-        # 节点 → 超边聚合（保留 D 维特征）
-        a   = torch.einsum('bne,bnd->bed', H_sparse, z)     # [B, E, D]
-        # 超边 → 节点聚合 + 节点度归一化
-        out = torch.einsum('bne,bed->bnd', H_w, a)          # [B, N, D]
-        out = out / D_v.unsqueeze(-1)                        # [B, N, D]
-
-        return torch.sigmoid(self.out_proj(out))             # [B, N, 1]
+        return torch.sigmoid(self.out_proj(out))            # [B, N, 1]
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -447,11 +440,11 @@ class Hyperion(nn.Module):
         # ── Stage 1-4 : 可学习节点条件嵌入 c ────────────────────────
         self.node_cond = nn.Parameter(torch.randn(N, c_dim))
 
-        # ── Stage 2 : 弹性编码器 ─────────────────────────────────────
-        self.resil_enc = _ResilienceEncoder(N)
+        # ── Stage 2 : 弹性编码器（全局标量 τ, δ）────────────────────
+        self.resil_enc = _ResilienceEncoder()
 
-        # ── Stage 3 : 动态超图卷积（图衰减→超边构造→超图卷积）────
-        self.hyper_conv = _DynamicHypergraphConv(
+        # ── Stage 3 : Graph ODE → 稀疏超图卷积（一体化，只做一次）─
+        self.hyper_conv = _GraphODEHypergraph(
             N, in_dim=D, k_per_edge=k_per_edge
         )
 
@@ -533,24 +526,24 @@ class Hyperion(nn.Module):
         B = long_term.size(0)
         N = long_term.size(2)
 
-        # ── Stage 2 : 弹性参数 ────────────────────────────────────────
-        tau, delta = self.resil_enc()                           # [N], [N]
-        log_tau    = torch.log(tau + 1e-6)                      # [N]
+        # ── Stage 2 : 全局弹性参数 ───────────────────────────────────
+        tau, delta = self.resil_enc()                 # [1], [1]  全局标量
+        log_tau    = torch.log(tau + 1e-6)            # [1]
 
         # ── Stage 1-4 : proj + GCN（RC-GLN 之前）────────────────────
-        # 先拿到 GCN 输出的时空特征，用于构造动态超边
         h_long_gcn  = self._proj_gcn(long_term,  self.long_proj,  self.gcn_long)
         h_short_gcn = self._proj_gcn(short_term, self.short_proj, self.gcn_short)
 
-        # ── Stage 3 : 动态超图卷积 ───────────────────────────────────
-        # δ 控制图衰减扩散比例 → 衰减后特征构造超边 → 超图卷积
-        x_diff = self.hyper_conv(h_long_gcn, delta)             # [B, N, 1]
-        self.last_x_diff = x_diff.detach()                      # 供外部 L_diff
+        # ── Stage 3 : Graph ODE → 稀疏超图卷积（整网只做一次）──────
+        # δ 作为 ODE 积分时域，控制扩散深度；扩散后特征动态构造超边
+        x_diff = self.hyper_conv(h_long_gcn, delta)  # [B, N, 1]
+        self.last_x_diff = x_diff.detach()            # 供外部 L_diff
 
         # ── Stage 4-5 : c_aug = [c ‖ log_τ ‖ δ ‖ x_diff] ──────────
-        c = self.node_cond.unsqueeze(0).expand(B, -1, -1)       # [B, N, c_dim]
-        log_tau_exp = log_tau.view(1, N, 1).expand(B, -1, -1)   # [B, N, 1]
-        delta_exp   = delta.view(1, N, 1).expand(B, -1, -1)     # [B, N, 1]
+        # τ, δ 是全局标量，广播到 [B, N, 1]
+        c = self.node_cond.unsqueeze(0).expand(B, -1, -1)          # [B, N, c_dim]
+        log_tau_exp = log_tau.view(1, 1, 1).expand(B, N, 1)        # [B, N, 1]
+        delta_exp   = delta.view(1, 1, 1).expand(B, N, 1)          # [B, N, 1]
         c_aug = torch.cat(
             [c, log_tau_exp, delta_exp, x_diff], dim=-1
         )  # [B, N, c_dim+3]
