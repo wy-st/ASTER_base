@@ -168,9 +168,6 @@ class _GraphODEHypergraph(nn.Module):
         # Stage 3：可学习超边权重
         self.edge_W = nn.Parameter(torch.ones(E))
 
-        # 输出：D → 1
-        self.out_proj = nn.Linear(in_dim, 1)
-
     def _f(self, H: torch.Tensor, A: torch.Tensor) -> torch.Tensor:
         """ODE 右端项: f(H) = tanh(A @ H @ W_ode)"""
         return torch.tanh(torch.einsum('nm,bmd->bnd', A, self.ode_W(H)))
@@ -212,7 +209,7 @@ class _GraphODEHypergraph(nn.Module):
         out  = torch.einsum('bne,bed->bnd', H_w, a)        # [B, N, D]
         out  = out / D_v.unsqueeze(-1)                      # [B, N, D]
 
-        return torch.sigmoid(self.out_proj(out))            # [B, N, 1]
+        return torch.tanh(out)                              # [B, N, D]  ∈ (-1,1)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -448,8 +445,8 @@ class Hyperion(nn.Module):
             N, in_dim=D, k_per_edge=k_per_edge
         )
 
-        # ── Stage 5-6 : RC-GLN 调制注意力层（c_aug_dim = c_dim + 3）─
-        c_aug_dim = c_dim + 3   # c ‖ log_τ(1) ‖ δ(1) ‖ x_diff(1)
+        # ── Stage 5-6 : RC-GLN 调制注意力层（c_aug_dim = c_dim + 2 + D）
+        c_aug_dim = c_dim + 2 + D   # c ‖ log_τ(1) ‖ δ(1) ‖ x_diff(D)
 
         self.rc_gln_long = nn.ModuleList([
             _RCGLNLayer(D, c_aug_dim, ffn_dim=D * 4,
@@ -478,9 +475,12 @@ class Hyperion(nn.Module):
             num_heads=heads, dropout=dropout,
         )
 
+        # ── 辅助损失投影：x_diff[D] → 1 维事件概率（供 L_diff 用）──
+        self.diff_head = nn.Linear(D, 1)
+
         # ── 对外暴露维度（供 train.py 计算 state_dim）───────────────
-        # state_hidden = h_long[D] ‖ x_diff[1] ‖ log_τ[1] ‖ δ[1]
-        self.state_hidden_dim: int = D + 3
+        # state_hidden = h_long[D] ‖ x_diff[D] ‖ log_τ[1] ‖ δ[1]
+        self.state_hidden_dim: int = 2 * D + 2
 
         # 用于外部读取 x_diff 计算辅助损失
         self.last_x_diff: torch.Tensor = None
@@ -536,8 +536,10 @@ class Hyperion(nn.Module):
 
         # ── Stage 3 : Graph ODE → 稀疏超图卷积（整网只做一次）──────
         # δ 作为 ODE 积分时域，控制扩散深度；扩散后特征动态构造超边
-        x_diff = self.hyper_conv(h_long_gcn, delta)  # [B, N, 1]
-        self.last_x_diff = x_diff.detach()            # 供外部 L_diff
+        x_diff = self.hyper_conv(h_long_gcn, delta)           # [B, N, D]
+        self.last_x_diff = torch.sigmoid(
+            self.diff_head(x_diff)
+        ).detach()                                             # [B, N, 1] 供外部 L_diff
 
         # ── Stage 4-5 : c_aug = [c ‖ log_τ ‖ δ ‖ x_diff] ──────────
         # τ, δ 是全局标量，广播到 [B, N, 1]
