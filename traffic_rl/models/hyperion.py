@@ -539,7 +539,7 @@ class Hyperion(nn.Module):
         x_diff = self.hyper_conv(h_long_gcn, delta)           # [B, N, D]
         self.last_x_diff = torch.sigmoid(
             self.diff_head(x_diff)
-        ).detach()                                             # [B, N, 1] 供外部 L_diff
+        )                                                      # [B, N, 1] 供外部 L_diff，不 detach 保留梯度
 
         # ── Stage 4-5 : c_aug = [c ‖ log_τ ‖ δ ‖ x_diff] ──────────
         # τ, δ 是全局标量，广播到 [B, N, 1]

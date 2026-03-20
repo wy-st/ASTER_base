@@ -159,17 +159,17 @@ def run_one_epoch(
             pred_loss = compute_predictor_loss(preds, tgt.unsqueeze(0), k)
 
             # ── L_diff 辅助损失（仅 Hyperion 使用，其他模型无 last_x_diff）──
-            # L_diff = MSE(x_diff, event_target)，其中 event_target 是
-            # 前 k_val 步内是否发生事件的 max 聚合二值标签
+            # tgt 已是二值标签 [K_max, N, 1]，取前 k_val 步内任一步发生事件为正样本
             x_diff_pred = getattr(predictor, 'last_x_diff', None)
             if x_diff_pred is not None:
                 event_tgt = (
-                    tgt[:k_val, :, 0:1]         # [k_val, N, 1]
-                    .max(dim=0).values           # [N, 1]
-                    .unsqueeze(0)                # [1, N, 1]
+                    tgt[:k_val, :, 0:1]          # [k_val, N, 1]
+                    .max(dim=0).values            # [N, 1]  k步内有事件=1
+                    .unsqueeze(0)                 # [1, N, 1] → 广播到 [B, N, 1]
+                    .expand_as(x_diff_pred)
                     .to(device)
                 )
-                l_diff    = F.mse_loss(x_diff_pred, event_tgt)
+                l_diff    = F.binary_cross_entropy(x_diff_pred, event_tgt)
                 pred_loss = pred_loss + 0.1 * l_diff
 
             optimizer.zero_grad()
